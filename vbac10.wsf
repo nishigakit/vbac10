@@ -1,0 +1,1312 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<package>
+
+<comment>
+The vbac is not VBA compiler.
+Instead, this unsophisticated script frees VBA code from binary files.
+This script is distributed as part of the Ariawase library.
+
+The Project Page: https://github.com/vbaidiot/Ariawase
+</comment>
+
+<job id="">
+<?job error="true" debug="false" ?>
+
+<runtime>
+<description></description>
+<example></example>
+</runtime>
+
+
+<resource id="HelpMessage">
+Usage: cscript vbac.wsf &lt;command&gt; [&lt;option&gt;]
+
+command:
+  combine           VB Componentsを対応するExcelファイルにimportする
+  decombine         Excelファイルから すべてのVB Componentsをexportする
+　copy              １つのVB Componentsを複数のExcelファイルにimportする
+  compare           １つのVB Componentsを複数のExcelファイルと比較する
+  clear             Excelファイルの すべてのVB Componentsを削除する
+  help              このヘルプを表示する
+
+option:
+  /binary:&lt;dir&gt;     combine/decombneするExcelファイルの格納フォルダーを指定する
+               	 　　(指定しないば場合: bin)
+  /source:&lt;dir&gt;     combine/decombneするVB Componentの格納フォルダーを指定する
+               	 　　(指定しない場合: src)
+  /cpysrc:&lt;dir&gt;     copyまたはcompareするVB Componentの格納フォルダーを指定する
+               	 　　(指定しない場合: cpy)
+  /binbak:&lt;dir&gt;     import/clear前にExcelファイルをバックアップするフォルダーを指定する
+               	 　　(指定しない場合: bak)
+  /bakon            Excelファイルのバックアップをする(デフォルトOFF)
+  /vbaproj          *.vbaprojファイルも対象にする
+
+</resource>
+
+
+<script language="JScript">
+<![CDATA[
+// Enumerations:
+//   Word   - http://msdn.microsoft.com/en-us/library/office/jj684104.aspx
+//   Excel  - http://msdn.microsoft.com/en-us/library/office/ff838815.aspx
+//   Access - http://msdn.microsoft.com/en-us/library/office/jj713155.aspx
+
+// WdSaveFormat
+var wdFormatDocument97 = 0 //.doc
+var wdFormatTemplate97 = 1 //.dot
+var wdFormatXMLDocumentMacroEnabled = 13 //.docm
+var wdFormatXMLTemplateMacroEnabled = 15 //.dotm
+
+// XlFileFormat
+var xlExcel9795 = 43; //.xls 97-2003 format in Excel 2003 or prev
+var xlExcel8    = 56; //.xls 97-2003 format in Excel 2007
+var xlTemplate  = 17; //.xlt
+var xlAddIn     = 18; //.xla
+var xlExcel12   = 50; //.xlsb
+var xlOpenXMLWorkbookMacroEnabled = 52; //.xlsm
+var xlOpenXMLTemplateMacroEnabled = 53; //.xltm
+var xlOpenXMLAddIn                = 55; //.xlam
+
+// AcNewDatabaseFormat
+var acNewDatabaseFormatAccess2000 =  9; //.mdb
+var acNewDatabaseFormatAccess2002 = 10; //.mdb
+var acNewDatabaseFormatAccess2007 = 12; //.accdb
+
+// AcSysCmdAction
+var acSysCmdAccessVer = 7;
+
+// AcObjectType
+var acTable  = 0;
+var acQuery  = 1;
+var acForm   = 2;
+var acReport = 3;
+var acMacro  = 4;
+var acModule = 5;
+
+// vbext_ct_* (ref: http://msdn.microsoft.com/en-us/library/office/gg264162.aspx)
+var vbext_ct_StdModule   = 1;
+var vbext_ct_ClassModule = 2;
+var vbext_ct_MSForm      = 3;
+var vbext_ct_Document    = 100;
+
+// FileSystemObject (ref: http://msdn.microsoft.com/en-us/library/hww8txat%28v=vs.84%29.aspx)
+var fso = WScript.CreateObject("Scripting.FileSystemObject");
+
+var forReading   = 1;
+var forWriting   = 2;
+var forAppending = 8;
+
+var scriptPath = WScript.ScriptFullName;
+
+var args = (function() {
+    var a = new Array(WScript.Arguments.length);
+    for (var i = 0; i < a.length; i++) a[i] = WScript.Arguments.item(i);
+    return a;
+}());
+
+var getResource = function(str) {
+    return scriptlet.getResource(str).replace(/^\s+|\s+$/g, "");
+};
+
+
+var logarray = new Array();
+var printLog = function(){ };
+printLog.prototype.input = function(str) {
+    WScript.Echo(str);
+    logarray.push(str);
+};
+printLog.prototype.output = function() {
+
+    var logdir = fso.GetParentFolderName(scriptPath);
+    //fso.CreateFolder(logdir)
+
+    var logPath = fso.BuildPath(logdir, dateTimeString(new Date())+'.txt');
+    println("ログファイルを生成: " + logPath);
+
+    var logfile = fso.OpenTextFile(logPath, 2, true, -2); //2:書き込み専用、true:ファイルが無ければ作成 -2:文字コード-システムデフォルト
+
+    var lengthOfarray = logarray.length;
+    for (var i=0; i < lengthOfarray; i++) logfile.WriteLine(logarray[i]);
+
+    logfile.Close();
+};
+
+logdata = new printLog();
+
+var println = function(str) {
+    WScript.Echo(str);
+};
+
+////////////////////////// デバッグ表示制御//////////////////////////
+var debugln = function(str) {
+//    if(debugMode) WScript.Echo(str);
+};
+////////////////////////////////////////////////////////////////////
+
+
+
+
+var foreachEnum = function(collection, callback) {
+
+    var xs = new Enumerator(collection);
+    var x = xs.item();
+    for (var i=0; !xs.atEnd(); xs.moveNext(), x=xs.item(), i++) {
+        if (!!callback(x, i)) break;
+    }
+}
+
+var dateTimeString = function(dt) {
+    var g = function(y) { return (y < 2000) ? 1900 + y : y; };
+    var f = function(n) { return (n < 10) ? "0" + n : n.toString(); };
+    var ymd = g(dt.getYear())  + f(dt.getMonth() + 1) + f(dt.getDate());
+    var hns = f(dt.getHours()) + f(dt.getMinutes())   + f(dt.getSeconds());
+    return ymd + " " + hns;
+};
+
+var typename = function(obj) {
+    if (obj === undefined) return 'Undefined';
+    if (obj == null) return 'Null';
+    return Object.prototype.toString.call(obj).slice(8, -1);
+};
+
+var isPathRooted = function(path) {
+    if (!path) return false;
+    
+    var p1 = path.substring(0, 1);
+    if (p1 == '\\' || p1 == '/') return true;
+    var p2 = path.substring(1, 2);
+    if (p2 == ':') return true;
+    return false;
+};
+
+var Conditional = function(val) {
+    this.flag  = false;
+    this.value = val;
+};
+Conditional.prototype.change = function(val) {
+    this.flag  = true;
+    if (val !== undefined) this.value = val;
+};
+
+
+var Config = function(binary, source, cpysrc, binbak) {
+
+    //各作業フォルダのパスを設定する
+    //　　絶対パスなら、そのまま使用
+    //　　相対パスなら、スクリプトコマンドのパスをrootにして作成
+
+    var root = fso.GetParentFolderName(scriptPath);
+
+    this.bin = (isPathRooted(binary)) ? binary : fso.BuildPath(root, binary);
+    this.src = (isPathRooted(source)) ? source : fso.BuildPath(root, source);
+    this.cpy = (isPathRooted(cpysrc)) ? cpysrc : fso.BuildPath(root, cpysrc);
+　　if (!binbak.flag) {
+        this.bak = undefined;
+    }
+    else {
+        this.bak = (isPathRooted(binbak.value)) ? binbak.value : fso.BuildPath(root, binbak.value);
+    }
+};
+Config.prototype.getBins = function() { return fso.GetFolder(this.bin).Files; };
+Config.prototype.getSrcs = function() { return fso.GetFolder(this.src).SubFolders; };
+
+var VBAProjFile = function(vbproj, srcdir) {
+    this.vbproj   = vbproj;
+    this.fileName = 'App.vbaproj';
+    this.path     = fso.BuildPath(srcdir, this.fileName);
+};
+VBAProjFile.prototype.projPropName = {
+    'Name': 1, 'Description': 1, 'HelpFile': 1, 'HelpContextID': 1
+};
+VBAProjFile.prototype.removeAllRefs = function() {
+    var self = this;
+    foreachEnum(this.vbproj.References, function(ref) {
+        if (ref.BuiltIn) return false;
+        self.vbproj.References.Remove(ref);
+    });
+};
+VBAProjFile.prototype.read = function(is64BitOffice) {
+    var isSection = function(line) { return line.match(/^\[.*\]$/) != null; };
+    var getParam  = function(line) {
+        var i = line.indexOf('=');
+        return (i > -1) ? { key: line.substring(0, i), val: line.substring(i+1) } : null;
+    };
+    
+    if (!fso.FileExists(this.path)) return;
+    
+    var fl = fso.OpenTextFile(this.path, forReading);
+    debugln("**** fl in VBAProjFile.read ****");
+
+    while (!fl.AtEndOfStream) {
+        var line    = fl.ReadLine();
+        var section = line;
+        
+        switch (section) {
+        case '[General]':
+            while (!fl.AtEndOfStream) {
+                line = fl.ReadLine();
+                if (isSection(line)) break;
+                
+                var p = getParam(line);
+                // quick-fix solution
+                if (is64BitOffice && p.key == "HelpContextID")
+                    logdata.input("! Warning: can not 'VBProject.HelpContextID = \"" + p.val + "\"'. probably 64-bit Office have a bug.");
+                else
+                    this.vbproj[p.key] = p.val;
+            }
+            break;
+        case '[Reference]':
+            this.removeAllRefs();
+            
+            while (!fl.AtEndOfStream) {
+                line = fl.ReadLine();
+                if (isSection(line)) break;
+                
+                var p = getParam(line);
+                var refinf = p.key.split(" ");
+                this.vbproj.References.AddFromGuid(refinf[0], refinf[1], refinf[2]);
+            }
+            break;
+        default:
+            break;
+        }
+    }
+};
+VBAProjFile.prototype.write = function() {
+    var fl = fso.OpenTextFile(this.path, forWriting, true);
+    debugln("**** fl in VBAProjFile.write ****");
+
+    
+    fl.WriteLine('[General]');
+    for (var prop in this.projPropName)
+        fl.WriteLine(prop + "=" + this.vbproj[prop]);
+    
+    fl.WriteLine('[Reference]');
+    foreachEnum(this.vbproj.References, function(ref) {
+        if (ref.BuiltIn) return false;
+        fl.WriteLine(ref.GUID + " " + ref.Major + " " + ref.Minor + "=" + ref.Description);
+    });
+    
+    fl.Close();
+};
+
+var Office = function() {
+    debugln(" Object Office is created");
+};
+
+Office.prototype.progID1 = undefined;
+Office.prototype.progID2 = "Application";
+
+Office.prototype.getProgID = function() {
+    return (this.progID1 !== undefined) ? this.progID1 + "." + this.progID2 : undefined;
+};
+
+Office.prototype.setCmdParam = function(cmdParam) {
+    this.cmdParam = cmdParam;
+};
+Office.prototype.isDirectiveOnly = function(codeModule) {
+    var ml = codeModule.CountOfLines;
+    var dl = codeModule.CountOfDeclarationLines;
+    if (ml > dl) return false;
+    if (ml < 1)  return true;
+    for (var i=0,arr=codeModule.Lines(1, dl).split("\r\n"),len=arr.length; i<len; i++) {
+        var s = arr[i].replace(/^\s+|\s+$/g, "");
+        if (s != "" && s.charAt(0).toLowerCase() != "o") return false;
+    }
+    return true;
+};
+Office.prototype.isValidFileName = function(fname) {
+    return fname.match(/[\\/:\*\?"<>\|]/) == null;
+};
+Office.prototype.loanOfOfficeDocument = function(path, isCreate, callback) {
+    throw "Not Implemented";
+};
+Office.prototype.checkMacroSecurity = function(ofDoc) {
+    try {
+        ofDoc.VBProject;
+    }
+    catch (ex) {
+        switch (ex.number) {
+        case -2146822220:
+            ex.description = [ex.description, "See also http://support.microsoft.com/kb/282830"].join("\n");
+            break;
+        case -2146827284:
+            ex.description = [ex.description, "See also http://support.microsoft.com/kb/813969"].join("\n");
+            break;
+        default:
+            break;
+        }
+        
+        throw ex;
+    }
+};
+Office.prototype.is64Bit = function(ofApp) {
+    // ref: http://support.microsoft.com/kb/2186281
+    return parseInt(ofApp.Version) >= 14
+        && ofApp.ProductCode.substring(20, 21) == "1";
+};
+Office.prototype.extensionTypeTable = (function() {
+    var tbl = {};
+    tbl['bas'] = vbext_ct_StdModule;        //1: 標準モジュール
+    tbl['cls'] = vbext_ct_ClassModule;      //2: クラスモジュール
+    tbl['frm'] = vbext_ct_MSForm;           //3: Microsft Form
+    tbl['frx'] = vbext_ct_MSForm;           //3: Microsft Form(バイナリ・フォーム・ファイル)
+    tbl['dcm'] = vbext_ct_Document;         //100: Documentモジュール
+    return tbl;
+})();
+Office.prototype.typeExtensionTable = (function () {
+    var tbl = {};
+    tbl[vbext_ct_StdModule]   = 'bas';
+    tbl[vbext_ct_ClassModule] = 'cls';
+    tbl[vbext_ct_MSForm]      = 'frm'; // with 'frx'
+    tbl[vbext_ct_Document]    = 'dcm';
+    return tbl;
+})();
+Office.prototype.addTargetType = function(typ) {
+};
+
+
+Office.prototype.cleanupBinary = function(ofDoc, verbose) {
+
+　　debugln("cleanupBinalyを実行");
+
+    var compos = ofDoc.VBProject.VBComponents;
+    var self   = this;
+    foreachEnum(compos, function(compo) {
+        var bname = compo.Name;
+        //if (!(compo.Type.toString() in self.typeExtensionTable)) return false;
+        if (compo.Type == vbext_ct_Document) {
+            if (self.isDirectiveOnly(compo.CodeModule)) return false;
+            compo.CodeModule.DeleteLines(1, compo.CodeModule.CountOfLines);
+        }
+        else {
+            compos.Remove(compo);
+        }
+        if (!!verbose) logdata.input("- Remove: " + bname);
+    });
+};
+
+
+Office.prototype.cleanupSource = function(dir, verbose) {
+
+　　debugln("cleanupSourceを実行"); //dirにあるVB Componentファイルをすべて消去する
+
+    if (!fso.FolderExists(dir)) {
+         fso.CreateFolder(dir);
+         return;
+    }
+    
+    var self = this;
+    foreachEnum(fso.GetFolder(dir).Files, function(fl) {
+        var fname = fso.GetFileName(fl.Path);
+        var xname = fso.GetExtensionName(fl.Path);
+        if (!(xname in self.extensionTypeTable)) return false;
+        
+        fl.Delete();
+        if (!!verbose) logdata.input("- Remove: " + fname);
+    });
+};
+Office.prototype.importComponent = function(path, ofDoc) {
+    //path: importするbas,cls,frmのfileのパス
+    //ofDoc: importする先のWorkbook
+    var compos = ofDoc.VBProject.VBComponents;
+    compos.Import(path);
+};
+Office.prototype.importDocument = function(path, ofDoc) {
+    throw "Not Implemented";
+};
+Office.prototype.importSource = function(impdir, ofDoc) {
+
+    //impdir: importするファイルがあるディレクトリ
+    //import先のWorkbook
+
+    var self = this;
+
+
+　　// xsにはimportするファイルのcollection
+    var xs = new Enumerator(fso.GetFolder(impdir).Files);
+    var x = xs.item();
+    for (var i=0; !xs.atEnd(); xs.moveNext(), x=xs.item(), i++) {
+
+        //xにはインポートするファイル
+
+        var xname = fso.GetExtensionName(x.Path); //xnameにはfileの拡張子(文字列)
+        var bname = fso.GetBaseName(x.Path);      //bnameには拡張子なしのfile名(文字列)
+　　　　
+        if (!(xname in self.extensionTypeTable) || (xname == 'frx')) {
+	    //拡張子が、bas,cls,frm,dcmでない、または、frx
+	    logdata.input("> Illegal Component: " + fso.GetFileName(x.Path));
+	}
+        else {        
+            if (xname != 'dcm') 
+                self.importComponent(x.Path, ofDoc);   //bas,cls,frm
+            else
+                self.importDocument(x.Path, ofDoc);    //dcm
+        
+            logdata.input("- Import: " + fso.GetFileName(x.Path));
+            if (xname == 'frm') logdata.input("- Import: " + bname + ".frx");
+	}
+    }
+};
+Office.prototype.importProject = function(impdir, vbproj, is64BitOffice) {
+    var proj = new VBAProjFile(vbproj, impdir);
+    if (fso.FileExists(proj.path)) {
+        proj.read(is64BitOffice);
+        logdata.input("- Import: " + proj.fileName);
+    }
+};
+Office.prototype.exportSource = function(ofDoc, expdir) {
+　　//ofDoc: export対象のWorkbook
+    //exdir: exportしたVBComponentを保存するディレクトリ
+
+    var self = this;
+
+    var xs = new Enumerator(ofDoc.VBProject.VBComponents);
+    var x = xs.item();
+    for (var i=0; !xs.atEnd(); xs.moveNext(), x=xs.item(), i++) {
+　　　　//xはVBComponent
+
+        //if (!(x.Type.toString() in self.typeExtensionTable)) break;
+        if ((x.Type == vbext_ct_Document) && (self.isDirectiveOnly(x.CodeModule))) {
+           //Documentモジュールで、コードがない場合、何もしない
+        }
+        else {
+            var xname = self.typeExtensionTable[x.Type.toString()]; //拡張子名
+            var bname = x.Name;                                     //拡張なしのファイル名
+            var fname = bname + "." + xname;                        //ファイル名
+            x.Export(fso.BuildPath(expdir, fname));
+
+            logdata.input('- Export: ' + fname);
+            if (xname == 'frm') logdata.input("- Export: " + bname + ".frx");
+        }
+    };
+};
+Office.prototype.compareSource = function(ofDoc, cmpdir) {
+　　//ofDoc: 比較対象のWorkbook
+    //cmpdir: 比較対象のVBComponentを保存するディレクトリ
+
+    //logdata.input("compareSource start!");
+    var self = this;
+
+    var xs = new Enumerator(ofDoc.VBProject.VBComponents);
+    var x = xs.item();
+    for (var i=0; !xs.atEnd(); xs.moveNext(), x=xs.item(), i++) {
+　　　　//xはVBComponent
+         var xname = self.typeExtensionTable[x.Type.toString()]; //拡張子名
+         var bname = x.Name;                                     //拡張なしのファイル名
+         var fname = bname + "." + xname;                        //ファイル名
+         var cmpPath = fso.BuildPath(cmpdir, fname);
+
+
+         //テンポラリでexportするworkフォルダを作成する（vbac10.wsfと同じ位置に作成）
+         var root = fso.GetParentFolderName(scriptPath)
+         var workdir = fso.BuildPath(root, 'work');
+        if (!fso.FolderExists(workdir)) fso.CreateFolder(workdir);
+
+
+         //テンポラリでexportするファイル名は、先頭に'temp_'を付けておく
+         var temp_fname = 'temp_' + fname;
+         var tempPath =  fso.BuildPath(workdir, temp_fname);
+
+
+        //if (!(x.Type.toString() in self.typeExtensionTable)) break;
+        if ((x.Type == vbext_ct_Document) && (self.isDirectiveOnly(x.CodeModule))) {
+
+             //Documentモジュールで、コードがない場合、比較するディレクトリにそのファイルがないことを確認する
+             if (fso.FileExists(cmpPath)) logdata.input("- Compare: " + fname + ", Error: Not found in Excel"); //Error
+
+        }
+        else {
+            //比較するディレクトリにそのファイルがあることを確認する
+            if (!fso.FileExists(cmpPath)) { 
+                logdata.input("- Compare: " + fname + ", Error: Not found in Dir"); //Error
+            }
+            else {
+
+                //ファイルがあった場合、さらに内容を比較する
+                var bline = x.CodeModule.CountOfLines;
+                var tso = fso.OpenTextFile(cmpPath, 8); //追記モードで開く
+                var cline = tso.Line;
+
+                try {
+                     //tso.Close;//なぜかエラーになる
+                }
+                catch(e){
+                     logdata.input("Text fileのCloseでエラー発生");
+                };
+
+                //logdata.input("- Compare: " + fname + ", Excel: " + bline +", Dir: " + cline); //一致
+
+                if (fso.FileExists(tempPath)) fso.DeleteFile(tempPath);
+
+                x.Export(tempPath);
+                var temp_tso = fso.OpenTextFile(tempPath, 8); //追記モードで開く
+                bline = temp_tso.Line;
+                
+                try {
+                     //temp_tso.Close; //なぜかエラーになる
+                }
+                catch(e){
+                     logdata.input("Temp fileのCloseでエラー発生");
+                };
+
+                try {
+                     //fso.DeleteFile(tempPath);//なぜかエラーになる
+                }
+                catch(e){
+                     logdata.input("Temp fileのDeleteでエラー発生");
+                };
+                
+                if (bline == cline) {
+
+                    //行数が一致していたら、さらに比較する
+
+
+
+                   // logdata.input("- Compare: " + fname) //一致
+
+                }
+                else
+                    logdata.input("- Compare: " + fname + ", Error: Excel: " + bline +", Dir: " + cline); //行数が不一致
+             }
+        }
+
+    };
+};
+Office.prototype.exportProject = function(vbproj, expdir) {
+    var proj = new VBAProjFile(vbproj, expdir)
+    proj.write();
+    logdata.input("- Export: " + proj.fileName);
+};
+
+var Dummy = function() {
+
+　　debuglin("Object Dummy is created");
+};
+Dummy.prototype = new Office();
+Dummy.prototype.combine   = function() {};
+Dummy.prototype.decombine = function() {};
+Dummy.prototype.clear     = function() {};
+
+
+var Excel = function() {
+　　debugln("Object Excel is created \n");
+};
+Excel.prototype = new Office();
+Excel.prototype.progID1 = "Excel";
+Excel.prototype.createOpenFile = function(xlApp, path) {
+
+    //import時のimport先のファイルのCreateまたはOpen
+    
+    var xlFileFormat;
+    var vernum = parseInt(xlApp.Version);
+
+    debugln("Excel.prototype.cerateOpenfile");
+    debugln("    path:" + path);
+    debugln("    file extension:" + fso.GetExtensionName(path));
+    debugln("");
+
+    switch (fso.GetExtensionName(path).toLowerCase()) {
+    case 'xls':  xlFileFormat = (vernum < 12) ? xlExcel9795 : xlExcel8;
+                 break;
+    case 'xlt':  xlFileFormat = xlTemplate;
+                 break;
+    case 'xla':  xlFileFormat = xlAddIn;
+                 break;
+    case 'xlsb': xlFileFormat = xlExcel12;
+                 break;
+    case 'xlsm': xlFileFormat = xlOpenXMLWorkbookMacroEnabled;
+                 break;
+    case 'xltm': xlFileFormat = xlOpenXMLTemplateMacroEnabled;
+                 break;
+    case 'xlam': xlFileFormat = xlOpenXMLAddIn;
+                 break;
+    default:     xlFileFormat = (vernum < 12) ? xlExcel9795 : xlOpenXMLWorkbookMacroEnabled;
+                 path        += (vernum < 12) ? '.xls'      : '.xlsm';
+                 break;
+    }
+    
+    var xlBook;
+    try {
+        //importするWorkbook（ファイル）があればOpen、なければ、Create
+        if (fso.FileExists(path)) {
+            xlBook = xlApp.Workbooks.Open(path);　//Opren
+        }
+        else {
+            xlBook = xlApp.Workbooks.Add(); //Create
+            xlBook.IsAddin = (xlFileFormat == xlAddIn) || (xlFileFormat == xlOpenXMLAddIn);
+            xlBook.SaveAs(path, xlFileFormat);
+        }
+    }
+    catch (ex) {
+        if (xlBook != null) xlBook.Close();
+        throw ex;
+    }
+    return xlBook;
+};
+Excel.prototype.combine = function(tsrc, tbin) {
+
+    logdata.input("> Command: " + this.cmdParam.commandType + ": VBAC > Excel");
+    logdata.input("> VBAC   : " + tsrc);
+    logdata.input("> Excel  : " + tbin);
+
+
+    var self = this;
+    var xlApp, xlBook;
+    error_flag = false;;
+    
+    try {
+        xlApp = new ActiveXObject(this.getProgID());
+        xlApp.DisplayAlerts = false;
+        xlApp.EnableEvents  = false;
+
+        try {
+            xlBook = this.createOpenFile(xlApp, tbin);
+            this.checkMacroSecurity(xlBook);
+
+            self.cleanupBinary(xlBook);
+
+            if (self.cmdParam.vbaproj) {
+　              var is64BitOffice = self.is64Bit(xlBook.Application);
+                self.importProject(tsrc, xlBook.VBProject, is64BitOffice);
+            }
+            self.importSource(tsrc, xlBook);
+            xlBook.Save();
+
+        } 
+        catch(e) {
+            error_flag = true;
+            logdata.input("Workbook処理中にエラー");
+
+        }
+        finally {
+            if (xlBook != null) {
+
+                try{
+                    xlBook.Close();//Workbookのクローズ処理
+                }
+                catch(e){
+                    logdata.input("Workbookのクローズ処理中にエラー");
+                }
+            }
+        }
+    } 
+    catch(e) {
+        error_flaf = true;
+	logdata.input("Application処理中にエラー");
+
+    }
+    finally {
+        if (xlApp  != null) {
+
+            try{
+                xlApp.Quit();//Appのクローズ処理
+            }
+            catch(e){
+                logdata.input("Applicationのクローズ中にエラー");
+            }
+        }
+    }
+
+    logdata.input();
+    return error_flag;
+};
+Excel.prototype.decombine = function(tbin, tsrc) {
+
+    logdata.input("> Command: " + this.cmdParam.commandType + ": Excel > VBAC");
+    logdata.input("> Excel  : " + tbin);
+    logdata.input("> VBAC   : " + tsrc);
+
+    var self = this;
+    var xlApp, xlBook;
+    error_flag = false;;
+
+
+    try {
+        xlApp = new ActiveXObject(this.getProgID());
+        xlApp.DisplayAlerts = false;
+        xlApp.EnableEvents  = false;
+
+        try {
+
+            xlBook = xlApp.Workbooks.Open(tbin);
+            this.checkMacroSecurity(xlBook);
+
+
+       　　 self.cleanupSource(tsrc);
+            
+            if (self.cmdParam.vbaproj) {
+               self.exportProject(xlBook.VBProject, tsrc);
+	    }
+            self.exportSource(xlBook, tsrc);
+
+        } 
+        catch(e) {
+            error_flaf = true;
+            logdata.input("Workbook処理中にエラー");
+        }
+        finally {
+            if (xlBook != null) xlBook.Close();//Workbookのクローズ処理
+        }
+
+    } 
+    catch(e) {
+        error_flaf = true;
+	logdata.input("Application処理中にエラー");
+    }
+    finally {
+        if (xlApp  != null) xlApp.Quit();//Appのクローズ処理
+    }
+
+    logdata.input();
+    return error_flag;
+
+};
+
+Excel.prototype.compare = function(tbin, tsrc) {
+
+    logdata.input("> Command: " + this.cmdParam.commandType + ": Excel and VBAC");
+    logdata.input("> Excel  : " + tbin);
+    logdata.input("> VBAC   : " + tsrc);
+
+    var self = this;
+    var xlApp, xlBook;
+    error_flag = false;;
+
+
+    try {
+        xlApp = new ActiveXObject(this.getProgID());
+        xlApp.DisplayAlerts = false;
+        xlApp.EnableEvents  = false;
+
+        try {
+
+            xlBook = xlApp.Workbooks.Open(tbin);
+            this.checkMacroSecurity(xlBook);
+
+
+       　　 //VBProjectも比較できるか不明なので、とりあえずコメントアウト
+            //if (self.cmdParam.vbaproj) {
+            //   self.exportProject(xlBook.VBProject, tsrc);
+	    //}
+            self.compareSource(xlBook, tsrc);
+
+        } 
+        catch(e) {
+            error_flaf = true;
+            logdata.input("Workbook処理中にエラー");
+        }
+        finally {
+            if (xlBook != null) xlBook.Close();//Workbookのクローズ処理
+        }
+
+    } 
+    catch(e) {
+        error_flaf = true;
+	logdata.input("Application処理中にエラー");
+    }
+    finally {
+        if (xlApp  != null) xlApp.Quit();//Appのクローズ処理
+    }
+
+    logdata.input();
+    return error_flag;
+
+};
+Excel.prototype.clear = function(tbin) {
+
+    logdata.input("> Command: " + this.cmdParam.commandType + ": VBAC");
+    logdata.input("> Excel  : " + tbin);
+    
+    var self = this;
+    var xlApp, xlBook;
+    error_flag = false;;
+
+    try {
+        xlApp = new ActiveXObject(this.getProgID());
+        xlApp.DisplayAlerts = false;
+        xlApp.EnableEvents  = false;
+
+        try {
+
+            xlBook = xlApp.Workbooks.Open(tbin);
+            this.checkMacroSecurity(xlBook);
+        
+
+            self.cleanupBinary(xlBook, true);
+            xlBook.Save();
+
+        } 
+        catch(e) {
+            error_flaf = true;
+            logdata.input("Workbook処理中にエラー");
+        }
+        finally {
+            if (xlBook != null) xlBook.Close();//Workbookのクローズ処理
+        }
+    } 
+    catch(e) {
+        error_flaf = true;
+	logdata.input("Application処理中にエラー");
+    }
+    finally {
+        if (xlApp  != null) xlApp.Quit();//Appのクローズ処理
+    }
+
+    logdata.input();
+    return error_flag;
+};
+Excel.prototype.importDocument = function(path, xlBook) {
+
+    //path: importする.dcmのfile
+    //xlBook: importする先のWorkbook
+
+    var compos = xlBook.VBProject.VBComponents;
+    var impCompo = compos.Import(path);
+    
+    var origCompo;
+    var cname=impCompo.Name;          //importしたVB Component名
+    var bname=fso.GetBaseName(path);  //import元のVB Component名
+    if (cname != bname) {
+　　　　//importするWorksheetが存在する場合、import元と異なる名前のコンポート(クラスモジュール)を作成し、
+        //Worksheetにimportされない
+        origCompo = compos.item(bname);
+　　　　//logdata.input("一致しない: cname = " + cname +" bname = " + bname);
+    }
+    else {
+　　　　//importするsheetが存在しない場合、シートを作成し
+　　　　logdata.input("> Not found the sheet for import: "+ bname);
+
+        var sht = xlBook.Worksheets.Add();　　　 // 追加したシート
+        compos  = xlBook.VBProject.VBComponents; // refreash Component collection
+        origCompo = compos.item(sht.CodeName);   // 追加したシートのVBコンポーネント
+        
+
+
+
+
+      　//謎の処理
+        var tmpname = "ImportTemp";
+        var find = function(cmps, name) {
+
+  　　　　　var xs = new Enumerator(cmps);
+            var x = xs.item();
+            for (var i=0; !xs.atEnd(); xs.moveNext(), x=xs.item(), i++){
+                if (x.Name == name) return true;
+            }
+            return false;
+        };
+        while (find(compos, tmpname)) tmpname += "1"; //これは何がしたい？
+        impCompo.Name  = tmpname; //インポートされたコンポーネントの名前を？？？
+        
+
+
+
+
+
+
+        origCompo.Name = cname;   //追加したしたシートのコンポーネント名をインポート元の名前にする
+　　　　//logdata.input("tmpname: "+ tmpname);
+　　　　//logdata.input("cname: "+ cname);
+    }
+    //Worksheetにクラスモジュールの中身をコピーして、クラスモジュールを削除する
+    var imod=impCompo.CodeModule;
+    var omod=origCompo.CodeModule;
+    omod.DeleteLines(1, omod.CountOfLines);  //事前にCelarしているので、いるのかな？
+    omod.AddFromString(imod.Lines(1, imod.CountOfLines));
+    compos.Remove(impCompo);
+};
+
+
+var Command = function(param) {
+    this.parameter = param;
+
+    debugln("スクリプトコマンドのパス: " + scriptPath +"\n");
+    this.config  = new Config(param.binary, param.source, param.cpysrc, param.binbak);
+
+    var conf = this.config;
+　　debugln("各作業フォルダのpathを作成");
+    debugln("    conf.bin = " + conf.bin);
+    debugln("    conf.src = " + conf.src);
+    debugln("    conf.cpy = " + conf.cpy);
+    debugln("    conf.bak = " + conf.bak);
+};
+Command.prototype.help = function() {
+    logdata.input(getResource('HelpMessage'));
+};
+Command.prototype.combine = function() {
+    
+    var conf = this.config;
+    //bakフォルダーがあれば、combineする前に、ファイルをbakフォルダーにコピーする
+    if (conf.bak !== undefined && fso.FolderExists(conf.bin)) {
+        if (!fso.FolderExists(conf.bak)) fso.CreateFolder(conf.bak);
+        
+        var bkdir = fso.BuildPath(conf.bak, dateTimeString(new Date()));
+        fso.CreateFolder(bkdir);
+        fso.CopyFile(fso.BuildPath(conf.bin, "*.*"), bkdir + "\\");
+        debugln("combine前に、Excelファイルをバックアップ");
+        logdata.input("> Backup : " + bkdir + "\n");
+   }
+
+　　//import元のフォルダーがなければ、実行を中止する
+    if (!fso.FolderExists(conf.src)) {
+        logdata.input("directory '" + conf.src + "' not exists.");
+        return;
+    }
+    //import先のフォルダーがなければ作成する
+    if (!fso.FolderExists(conf.bin)) fso.CreateFolder(conf.bin);
+    
+
+    var self = this;
+    var xs = new Enumerator(conf.getSrcs());
+    var fx = xs.item();
+    for (var i=0; !xs.atEnd(); xs.moveNext(), fx=xs.item(), i++) {
+
+        if (fx.Name.substring(0, 2) == '~$') {
+
+            //'~$'で始まるファイルはテンポラリファイルなので処理しない。
+        }
+　　　　else {
+	    var fromPath = fx.Path;
+            //import先のファイルpathを作成する(import先のdir+import元のフォルダー名)
+            var toPath  = fso.BuildPath(conf.bin, fso.GetFileName(fromPath));
+
+
+            //フォルダ名のextensionから、Excelであれば、Excelオブジェクトを作る
+            var office;
+            switch (fso.GetExtensionName(fx.Path).toLowerCase()) {
+            case 'xls': case 'xlsm': case 'xla': case 'xlam': case 'xlt': case 'xltm': case 'xlsb':
+                office = new Excel();
+                break;
+            default:
+                office = new Dummy();
+                break;
+            }
+
+            debugln("offce.combineの引数の確認");
+            debugln("    command: "+ self.parameter.commandType);
+            debugln("    fromPath: " + fromPath);
+            debugln("    toPath: " + toPath);
+
+            office.setCmdParam(self.parameter);
+            office.combine(fromPath, toPath);
+        };
+    };
+};
+Command.prototype.copy = function() {
+    
+    var conf = this.config;
+    //bakフォルダーがあれば、copyする前に、ファイルをbakフォルダーにコピーする
+    if (conf.bak !== undefined && fso.FolderExists(conf.bin)) {
+        if (!fso.FolderExists(conf.bak)) fso.CreateFolder(conf.bak);
+        
+        var bkdir = fso.BuildPath(conf.bak, dateTimeString(new Date()));
+        fso.CreateFolder(bkdir);
+        fso.CopyFile(fso.BuildPath(conf.bin, "*.*"), bkdir + "\\");
+        debugln("combine前に、Excelファイルをバックアップ");
+        logdata.input("> Backup : " + bkdir + "\n");
+    }
+
+　　//import元のフォルダーがなければ、実行を中止する
+    if (!fso.FolderExists(conf.cpy)) {
+        logdata.input("directory '" + conf.cpy + "' not exists.");
+        return;
+    }
+    //import先のフォルダーがなければ作成する
+    if (!fso.FolderExists(conf.bin)) fso.CreateFolder(conf.bin);
+    
+
+    var self = this;
+    var xs = new Enumerator(fso.GetFolder(conf.bin).Files);
+    var fl = xs.item();
+    for (var i=0; !xs.atEnd(); xs.moveNext(), fl=xs.item(), i++) {
+
+        if (fl.Name.substring(0, 2) == '~$') {
+
+            //'~$'で始まるファイルはテンポラリファイルなので処理しない。
+        }
+        else {
+            //import先のファイルpath
+            var toPath  = fl;
+
+            //フォルダ名のextensionから、Excelであれば、Excelオブジェクトを作る
+            var office;
+            switch (fso.GetExtensionName(toPath).toLowerCase()) {
+            case 'xls': case 'xlsm': case 'xla': case 'xlam': case 'xlt': case 'xltm': case 'xlsb':
+                office = new Excel();
+                break;
+            default:
+                office = new Dummy();
+                break;
+            }
+
+            debugln("offce.combineの引数の確認");
+            debugln("    command: "+ self.parameter.commandType);
+            debugln("    fromPath: " + conf.cpy);
+            debugln("    toPath: " + toPath);
+
+            office.setCmdParam(self.parameter);
+            office.combine(conf.cpy, toPath); 
+        };
+    };
+};
+Command.prototype.decombine = function() {
+    var conf = this.config;
+
+ 　　//export元のフォルダがなければ、実行を中止する
+    if (!fso.FolderExists(conf.bin)) {
+        logdata.input("directory '" + conf.bin + "' not exists.");
+        return;
+    }
+    //export先のフォルダーがなければ作成する
+    if (!fso.FolderExists(conf.src)) fso.CreateFolder(conf.src);
+    
+
+    var self = this;
+    var xs = new Enumerator(conf.getBins());
+    var fl = xs.item();
+    for (var i=0; !xs.atEnd(); xs.moveNext(), fl=xs.item(), i++) {
+
+
+        if (fl.Name.substring(0, 2) == '~$') {
+
+           //'~$'で始まるファイルはテンポラリファイルなので処理しない。
+        }
+        else {
+	    var fromPath = fl.Path;
+            //export先のフォルダーpathを作成する(先のdir+元のファイル名)
+            var toPath  = fso.BuildPath(conf.src, fso.GetFileName(fromPath));
+
+            var office;
+            //ファイル名のextensionから、Excelであれば、Excelオブジェクトを作る
+            switch (fso.GetExtensionName(fromPath).toLowerCase()) {
+            case 'xls': case 'xlsm': case 'xla': case 'xlam': case 'xlt': case 'xltm': case 'xlsb':
+                office = new Excel();
+                break;
+            default:
+                office = new Dummy();
+                break;
+            }
+
+            debugln("offce.decombineの引数の確認");
+            debugln("    command: "+ self.parameter.commandType);
+            debugln("    fromPath: " + fromPath);
+            debugln("    toPath: " + toPath);
+
+            office.setCmdParam(self.parameter);
+            office.decombine(fromPath, toPath);
+        };
+    };
+};
+Command.prototype.compare = function() {
+    var conf = this.config;
+
+ 　　//export元のフォルダがなければ、実行を中止する
+    if (!fso.FolderExists(conf.bin)) {
+        logdata.input("directory '" + conf.bin + "' not exists.");
+        return;
+    }
+    //比較元のフォルダーがなければ、実行を中止する
+    if (!fso.FolderExists(conf.cpy)) {
+        logdata.input("directory '" + conf.cpy + "' not exists.");
+        return;
+    }
+
+    var self = this;
+    var xs = new Enumerator(conf.getBins());
+    var fl = xs.item();
+    for (var i=0; !xs.atEnd(); xs.moveNext(), fl=xs.item(), i++) {
+
+
+        if (fl.Name.substring(0, 2) == '~$') {
+
+           //'~$'で始まるファイルはテンポラリファイルなので処理しない。
+        }
+        else {
+	    var fromPath = fl.Path;
+            var toPath  = conf.cpy;
+
+            var office;
+            //ファイル名のextensionから、Excelであれば、Excelオブジェクトを作る
+            switch (fso.GetExtensionName(fromPath).toLowerCase()) {
+            case 'xls': case 'xlsm': case 'xla': case 'xlam': case 'xlt': case 'xltm': case 'xlsb':
+                office = new Excel();
+                break;
+            default:
+                office = new Dummy();
+                break;
+            }
+
+            //logdata.input("offce.compareの引数の確認");
+            //logdata.input("    command: "+ self.parameter.commandType);
+            //logdata.input("    fromPath: " + fromPath);
+            //logdata.input("    toPath: " + toPath);
+
+            office.setCmdParam(self.parameter);
+            office.compare(fromPath, toPath);
+        };
+    };
+};
+
+Command.prototype.clear = function() {
+
+    var conf = this.config;
+
+    //bakフォルダーがあれば、clearする前に、ファイルをbakフォルダーにコピーする
+    if (conf.bak !== undefined && fso.FolderExists(conf.bin)) {
+        if (!fso.FolderExists(conf.bak)) fso.CreateFolder(conf.bak);
+        
+        var bkdir = fso.BuildPath(conf.bak, dateTimeString(new Date()));
+        fso.CreateFolder(bkdir);
+        fso.CopyFile(fso.BuildPath(conf.bin, "*.*"), bkdir + "\\");
+        debugln("clear前に、Excelファイルをバックアップ");
+        logdata.input("> Backup : " + bkdir + "\n");
+    }
+
+    var self = this;
+    var xs = new Enumerator(fso.GetFolder(conf.bin).Files);
+    var fl = xs.item();
+
+    for (var i=0; !xs.atEnd(); xs.moveNext(), fl=xs.item(), i++) {
+       if (self.isTempFile(fl.Name)) {
+
+           //'~$'で始まるファイルはテンポラリファイルなので処理しない。
+       }
+       else{
+	
+           var office;
+           switch (fso.GetExtensionName(fl.Path).toLowerCase()) {
+           case 'xls': case 'xlsm': case 'xla': case 'xlam': case 'xlt': case 'xltm': case 'xlsb':
+               office = new Excel();
+               break;
+           default:
+               office = new Dummy();
+               break;
+           }
+
+           debugln("office.clearの引数の確認");
+           debugln("    fl.Path = " + fl.Path + "\n");
+
+           office.setCmdParam(self.parameter);
+           office.clear(fl.Path);
+       }
+    }
+};
+Command.prototype.isTempFile = function(fname) {
+    return fname.substring(0, 2) == '~$';
+};
+
+
+function main(args) {
+
+    println("************************************");
+    println("***           vbac10.02          ***");
+    println("************************************");
+
+　　//コマンド実行のパラメータを定義して、初期値を設定
+    var param = {
+            commandType: "help",　　　　　　　　　　　　//引数がないときはhelpが実行されるようにする
+            binary:      "bin",				//Excelファイルのディレクトリ（デフォルトは bin)
+            source:      "src",				//VBコンポーネントのディレクトリ(デフォルトはsrc)
+            cpysrc:	 "cpy",				//コピー用のVBコンポーネントのディレクトリ(デフォルトはcpy)
+　　　　　　binbak:      new Conditional("bak"), 	//binフォルダーのファイルのバックアップフォルダー
+            vbaproj:     false,			 	//.vbaprojも対象とするかどうか
+            incQuery:    false, 		 	//使用していない
+            dbCompact:   false			 	//使用していない
+    };
+    param.binbak.flag = false;				//import前のExcelファイルのバックアップをOFFにする
+
+    //コマンドの引数から、実行パラメーターを設定する
+    //コマンド形式 vbac.wsf <command> [<option>…]
+    var pname;
+    var value;
+    for (var i = 0; i < args.length; i++) {
+
+        pname = args[i];
+        value = undefined;
+         
+        switch (args[i].charAt(0)) {
+
+        case '-'://引数の１文字目が'-'か '/'(例) /bainary:bin1 とか　-bainary=bin1
+        case '/': 
+            var j = -1;
+            if (j < 0) j = pname.indexOf(':');
+            if (j < 0) j = pname.indexOf('=');
+            if (j > -1) {//引数の途中に':'か'='が含まれている　
+                value = pname.substring(j + 1);//dir名を入れる
+		pname = pname.substring(0, j); 
+            }
+            break;
+        default: 
+            pname = args[i];
+            value = '';
+            break;
+        }
+
+       debugln("引数を切り出した内容を確認 pname = "+ pname + "; value = " + value + "\n" );
+
+        switch (pname) {
+        case 'combine':
+        case 'decombine':
+        case 'clear':
+　　　　case 'copy':
+        case 'compare':
+        case 'help':
+	   param.commandType = pname;	//実行するコマンド
+	   break;
+        case '/binary':			//Excelファイルのディレクトリ指定
+        case '-binary':
+           param.binary = value;
+           break;
+        case '/source':			//VBコンポーネントのディレクトリ指定
+        case '-source':
+           param.source = value;
+           break;
+        case '/cpysrc':			//コピー用VBコンポーネントのディレクトリ指定
+        case '-cpysrc':
+           param.cpysrc = value;
+           break;
+        case '/binbak':			//Excelファイルのバックアップ用ディレクトリ指定
+           param.binbak.value = value;
+           param.binbak.flag = true;
+         case '/bakon':			//backupをONにする指定
+           param.binbak.flag = true;
+       case '/vbaproj':		//.vbaprojも対象とするオプション指定
+           param.vbaproj = true;
+       default:
+           break;
+        }
+    };
+
+
+　　debugln("実行パラメーターの確認");
+    debugln("    commandType:" + param.commandType);
+    debugln("    binary dir:" + param.binary);
+    debugln("    source dir:" + param.source);
+    debugln("    cpysrc dir:" + param.cpysrc);
+    debugln("    binbak dir:" + param.binbak.value);
+
+    if (param.binbak.flag) debugln("    backup ON")
+    else  debugln("    backup OFF");
+
+    var h = new Command(param);
+
+
+　　debugln("\n コマンド実行：" + param.commandType);
+   if (param.commandType == 'help') {
+        h.help();
+    }
+    else {
+        h[param.commandType]();
+    }
+　　debugln("\n コマンド終了：" + param.commandType);
+
+    logdata.output();
+
+}
+
+main(args);
+]]>
+</script>
+</job>
+</package>
